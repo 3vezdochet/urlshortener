@@ -1,0 +1,35 @@
+# === GoLand / JetBrains IDE ===
+.idea/
+*.iml
+*.iws
+/shelf/
+/workspace.xml
+/httpRequests/
+/dataSources/
+/dataSources.local.xml
+
+# === Go Binaries and Artifacts ===
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+*.coverprofile
+profile.cov
+
+# === Dependencies ===
+# Uncomment the line below if you do not want to check in your vendored dependencies
+# vendor/
+
+# === Go Workspaces and Environments ===
+go.work
+go.work.sum
+.env
+.env.*
+!.env.example
+
+# === OS Specific files ===
+.DS_Store
+Thumbs.db
