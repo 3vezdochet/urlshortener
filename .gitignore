@@ -33,3 +33,4 @@ go.work.sum
 # === OS Specific files ===
 .DS_Store
 Thumbs.db
+plan.md
