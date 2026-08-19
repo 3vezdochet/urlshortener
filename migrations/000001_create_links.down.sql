@@ -1,0 +1,2 @@
+DROP SEQUENCE IF EXISTS link_code_seq;
+DROP TABLE IF EXISTS links;
