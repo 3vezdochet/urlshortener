@@ -15,5 +15,44 @@ services:
       timeout: 5s
       retries: 5
 
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  migrate:
+    build:
+      context: ../..
+      dockerfile: deployments/docker/Dockerfile.api
+    entrypoint: ["/usr/local/bin/migrate"]
+    environment:
+      DATABASE_URL: postgres://urlshortener:urlshortener@postgres:5432/urlshortener?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    build:
+      context: ../..
+      dockerfile: deployments/docker/Dockerfile.api
+    ports:
+      - "8080:8080"
+    environment:
+      HTTP_ADDR: ":8080"
+      DATABASE_URL: postgres://urlshortener:urlshortener@postgres:5432/urlshortener?sslmode=disable
+      REDIS_ADDR: "redis:6379"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
 volumes:
   pgdata:
