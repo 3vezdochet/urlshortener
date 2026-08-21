@@ -147,6 +147,56 @@ func TestService_Resolve_Expired(t *testing.T) {
 	}
 }
 
+func TestService_Get(t *testing.T) {
+	svc := newService(t)
+	ctx := context.Background()
+
+	link, err := svc.Create(ctx, shortener.CreateRequest{OriginalURL: "https://example.com"})
+	if err != nil {
+		t.Fatalf("Create() unexpected error: %v", err)
+	}
+
+	got, err := svc.Get(ctx, link.Code)
+	if err != nil {
+		t.Fatalf("Get() unexpected error: %v", err)
+	}
+	if got.OriginalURL != link.OriginalURL {
+		t.Errorf("Get() OriginalURL = %q, want %q", got.OriginalURL, link.OriginalURL)
+	}
+}
+
+func TestService_Get_NotFound(t *testing.T) {
+	svc := newService(t)
+
+	_, err := svc.Get(context.Background(), "missing")
+	if !errors.Is(err, domain.ErrLinkNotFound) {
+		t.Fatalf("Get() error = %v, want %v", err, domain.ErrLinkNotFound)
+	}
+}
+
+func TestService_Get_ReturnsDeactivatedLink(t *testing.T) {
+	svc := newService(t)
+	ctx := context.Background()
+
+	link, err := svc.Create(ctx, shortener.CreateRequest{OriginalURL: "https://example.com"})
+	if err != nil {
+		t.Fatalf("Create() unexpected error: %v", err)
+	}
+	if err := svc.Deactivate(ctx, link.Code); err != nil {
+		t.Fatalf("Deactivate() unexpected error: %v", err)
+	}
+
+	// Unlike Resolve, Get should still return the link — a deactivated
+	// link is metadata an owner can inspect, not a 404.
+	got, err := svc.Get(ctx, link.Code)
+	if err != nil {
+		t.Fatalf("Get() unexpected error: %v", err)
+	}
+	if got.Active {
+		t.Error("Get() Active = true, want false")
+	}
+}
+
 func TestService_Deactivate(t *testing.T) {
 	svc := newService(t)
 	ctx := context.Background()
