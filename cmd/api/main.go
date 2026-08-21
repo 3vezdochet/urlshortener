@@ -16,6 +16,7 @@ import (
 	"urlshortener/internal/config"
 	"urlshortener/internal/delivery/httpapi"
 	"urlshortener/internal/repository/postgres"
+	"urlshortener/internal/repository/rediscache"
 	"urlshortener/internal/usecase/shortener"
 )
 
@@ -43,13 +44,40 @@ func run(logger *slog.Logger) error {
 	}
 	defer pool.Close()
 
-	svc := shortener.New(
-		postgres.NewLinkRepo(pool),
-		postgres.NewCodeGen(pool, "link_codes"),
+	svcOpts := []shortener.Option{
 		shortener.WithDefaultTTL(cfg.DefaultLinkTTL),
-	)
+		shortener.WithLogger(logger),
+	}
 
-	router := httpapi.NewRouter(svc, pool, logger)
+	// Caching is opt-in: only wire it up (and only add its readiness
+	// check) when REDIS_ADDR is actually configured. Without it, the
+	// service runs exactly as it did before caching existed.
+	pingers := []func(context.Context) error{pool.Ping}
+
+	if cfg.RedisAddr != "" {
+		redisClient, err := rediscache.NewClient(ctx, cfg.RedisAddr)
+		if err != nil {
+			return err
+		}
+		defer redisClient.Close()
+
+		svcOpts = append(svcOpts, shortener.WithCache(rediscache.NewCache(redisClient)))
+		if cfg.CacheTTL > 0 {
+			svcOpts = append(svcOpts, shortener.WithCacheTTL(cfg.CacheTTL))
+		}
+		if cfg.NegativeCacheTTL > 0 {
+			svcOpts = append(svcOpts, shortener.WithNegativeCacheTTL(cfg.NegativeCacheTTL))
+		}
+
+		pingers = append(pingers, func(ctx context.Context) error { return redisClient.Ping(ctx).Err() })
+		logger.Info("cache enabled", "redis_addr", cfg.RedisAddr)
+	} else {
+		logger.Info("cache disabled (REDIS_ADDR not set)")
+	}
+
+	svc := shortener.New(postgres.NewLinkRepo(pool), postgres.NewCodeGen(pool, "link_codes"), svcOpts...)
+
+	router := httpapi.NewRouter(svc, multiPinger(pingers), logger)
 	srv := httpapi.NewServer(cfg.HTTPAddr, router)
 
 	errCh := make(chan error, 1)
@@ -71,4 +99,19 @@ func run(logger *slog.Logger) error {
 	defer cancel()
 
 	return srv.Shutdown(shutdownCtx)
+}
+
+// multiPinger satisfies handler.Pinger by checking every dependency in
+// order, failing readiness on the first one that doesn't respond. Defined
+// locally rather than in the handler package, which deliberately doesn't
+// import any specific driver (postgres or redis).
+type multiPinger []func(context.Context) error
+
+func (m multiPinger) Ping(ctx context.Context) error {
+	for _, ping := range m {
+		if err := ping(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
 }
