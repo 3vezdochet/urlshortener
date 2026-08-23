@@ -1,0 +1,32 @@
+// ASSUMED CONTRACT — not generated from the real rate limiter project.
+//
+// This mirrors a typical GCRA rate limiter gRPC API (single Allow RPC,
+// key in, allowed/retry-after out). If your existing rate limiter service
+// exposes a different method or message shape, replace this file with its
+// real .proto (or copy it in from that project) and regenerate — this is
+// the only file that should need to change; internal/ratelimit.Limiter
+// and everything above it don't know or care about the wire format.
+syntax = "proto3";
+
+package ratelimit.v1;
+
+option go_package = "urlshortener/internal/ratelimit/grpcclient/ratelimitv1;ratelimitv1";
+
+service RateLimiter {
+  // Allow reports whether a single request identified by key should be
+  // permitted right now under the service's configured GCRA policy.
+  rpc Allow(AllowRequest) returns (AllowResponse);
+}
+
+message AllowRequest {
+  // key identifies the caller/resource being limited — an API key's
+  // owner ID for authenticated routes, a client IP for anonymous ones.
+  string key = 1;
+}
+
+message AllowResponse {
+  bool allowed = 1;
+  // retry_after_ms is set when allowed is false: how long the caller
+  // should wait before retrying, in milliseconds.
+  int64 retry_after_ms = 2;
+}
