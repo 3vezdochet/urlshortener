@@ -47,3 +47,34 @@ type LinkCache interface {
 	// call to complete.
 	Invalidate(ctx context.Context, code string) error
 }
+
+// HealthRepository stores and retrieves link availability check state.
+// Split from LinkRepository because the checker queries it in a
+// completely different pattern (claim a due batch, work it, record
+// results) than the API queries links (get by code). Implementations must
+// be safe for concurrent use — ClaimDue in particular must guarantee two
+// concurrent checker replicas never claim the same row.
+type HealthRepository interface {
+	// EnsureScheduled creates a health record for code if one doesn't
+	// already exist yet, due at dueAt. Called when a link is created, so
+	// every link eventually gets checked without a separate backfill
+	// step. Safe to call more than once for the same code (no-op after
+	// the first).
+	EnsureScheduled(ctx context.Context, code string, dueAt time.Time) error
+
+	// ClaimDue reserves up to limit records due at or before now by
+	// pushing their next-check time forward by leaseFor — a short,
+	// self-healing reservation: a worker that crashes mid-check simply
+	// lets the lease expire, and the row becomes claimable again with no
+	// separate cleanup job. Returns what was claimed.
+	ClaimDue(ctx context.Context, now time.Time, limit int, leaseFor time.Duration) ([]DueCheck, error)
+
+	// Record persists the outcome of a single check and schedules
+	// nextCheckAt for the following one.
+	Record(ctx context.Context, result HealthResult, nextCheckAt time.Time) error
+
+	// GetByCode returns the current health record for code, or
+	// ErrLinkNotFound if none exists yet (e.g. checking hasn't run for
+	// this link).
+	GetByCode(ctx context.Context, code string) (*LinkHealth, error)
+}
