@@ -27,13 +27,23 @@ const (
 	defaultNegativeCacheTTL = time.Minute
 )
 
+// HealthScheduler schedules a newly created link for its first
+// availability check. A small, consumer-side interface — this package
+// doesn't need to know anything else about how checking works, only that
+// something can be told "start watching this code". Satisfied structurally
+// by anything with this one method, including domain.HealthRepository.
+type HealthScheduler interface {
+	EnsureScheduled(ctx context.Context, code string, dueAt time.Time) error
+}
+
 // Service implements link shortening and resolution.
 type Service struct {
-	repo    domain.LinkRepository
-	codeGen domain.CodeGenerator
-	cache   domain.LinkCache // optional; nil disables caching entirely
-	now     Clock
-	logger  *slog.Logger
+	repo            domain.LinkRepository
+	codeGen         domain.CodeGenerator
+	cache           domain.LinkCache // optional; nil disables caching entirely
+	healthScheduler HealthScheduler  // optional; nil disables availability checking entirely
+	now             Clock
+	logger          *slog.Logger
 
 	ttl              time.Duration
 	cacheTTL         time.Duration
@@ -72,6 +82,14 @@ func WithCacheTTL(ttl time.Duration) Option {
 // WithCache is also set.
 func WithNegativeCacheTTL(ttl time.Duration) Option {
 	return func(s *Service) { s.negativeCacheTTL = ttl }
+}
+
+// WithHealthScheduler enables scheduling a first availability check for
+// every link created. Without this option, Create doesn't touch
+// availability checking at all — same "off unless configured" pattern as
+// WithCache.
+func WithHealthScheduler(hs HealthScheduler) Option {
+	return func(s *Service) { s.healthScheduler = hs }
 }
 
 // WithLogger overrides the logger used to report cache errors (default
@@ -141,6 +159,7 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (*domain.Link, 
 	// lookup of a code that didn't exist yet — clear that immediately
 	// rather than waiting out the negative TTL.
 	s.invalidateCache(ctx, code)
+	s.scheduleHealthCheck(ctx, code)
 
 	return link, nil
 }
@@ -247,6 +266,18 @@ func (s *Service) invalidateCache(ctx context.Context, code string) {
 	}
 	if err := s.cache.Invalidate(ctx, code); err != nil {
 		s.logger.Warn("cache invalidate failed", "code", code, "error", err)
+	}
+}
+
+// scheduleHealthCheck best-effort schedules code's first availability
+// check. A failure here is logged, never returned — the link itself was
+// already created successfully, and checking is a secondary feature.
+func (s *Service) scheduleHealthCheck(ctx context.Context, code string) {
+	if s.healthScheduler == nil {
+		return
+	}
+	if err := s.healthScheduler.EnsureScheduled(ctx, code, s.now()); err != nil {
+		s.logger.Warn("schedule health check failed", "code", code, "error", err)
 	}
 }
 
