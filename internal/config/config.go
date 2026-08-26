@@ -8,6 +8,8 @@ import (
 	"os"
 	"strconv"
 	"time"
+
+	"urlshortener/internal/auth"
 )
 
 // Config holds runtime configuration for the API service.
@@ -25,14 +27,28 @@ type Config struct {
 	// package's own default") unless the corresponding env var is set.
 	CacheTTL         time.Duration
 	NegativeCacheTTL time.Duration
+
+	// APIKeys authenticates POST/DELETE /v1/links — always enforced, not
+	// optional. An empty store (API_KEYS unset) is valid and safe: it
+	// just rejects every request until keys are issued, rather than
+	// silently allowing unauthenticated writes.
+	APIKeys auth.StaticKeyStore
+	// RateLimiterAddr enables gRPC rate limiting when non-empty — like
+	// RedisAddr, an optional protective layer, not a hard dependency.
+	RateLimiterAddr string
+
+	// CheckerInterval is how often cmd/checker polls for due availability
+	// checks. Unused by cmd/api.
+	CheckerInterval time.Duration
 }
 
 // Load reads configuration from the environment, applying defaults where
 // sensible and failing fast on anything required but missing or invalid.
 func Load() (Config, error) {
 	cfg := Config{
-		HTTPAddr:  getEnv("HTTP_ADDR", ":8080"),
-		RedisAddr: os.Getenv("REDIS_ADDR"),
+		HTTPAddr:        getEnv("HTTP_ADDR", ":8080"),
+		RedisAddr:       os.Getenv("REDIS_ADDR"),
+		RateLimiterAddr: os.Getenv("RATE_LIMITER_ADDR"),
 	}
 
 	dsn := os.Getenv("DATABASE_URL")
@@ -40,6 +56,12 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("DATABASE_URL is required")
 	}
 	cfg.DatabaseURL = dsn
+
+	apiKeys, err := auth.ParseStaticKeys(os.Getenv("API_KEYS"))
+	if err != nil {
+		return Config{}, fmt.Errorf("parse API_KEYS: %w", err)
+	}
+	cfg.APIKeys = apiKeys
 
 	defaultTTL, err := parseSecondsEnv("DEFAULT_LINK_TTL_SECONDS", "0")
 	if err != nil {
@@ -58,6 +80,12 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	cfg.NegativeCacheTTL = negativeCacheTTL
+
+	checkerInterval, err := parseSecondsEnv("CHECKER_INTERVAL_SECONDS", "30")
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.CheckerInterval = checkerInterval
 
 	return cfg, nil
 }
