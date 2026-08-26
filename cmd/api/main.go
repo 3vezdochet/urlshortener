@@ -15,6 +15,8 @@ import (
 
 	"urlshortener/internal/config"
 	"urlshortener/internal/delivery/httpapi"
+	"urlshortener/internal/ratelimit"
+	"urlshortener/internal/ratelimit/grpcclient"
 	"urlshortener/internal/repository/postgres"
 	"urlshortener/internal/repository/rediscache"
 	"urlshortener/internal/usecase/shortener"
@@ -35,6 +37,10 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 
+	if len(cfg.APIKeys) == 0 {
+		logger.Warn("API_KEYS is empty — every POST/DELETE /v1/links request will be rejected until keys are issued")
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -44,9 +50,17 @@ func run(logger *slog.Logger) error {
 	}
 	defer pool.Close()
 
+	// Health checking always uses this same Postgres connection — unlike
+	// Redis/the rate limiter, it isn't separate infrastructure to opt
+	// into. cmd/checker is still a genuinely separate, optional process:
+	// running cmd/api without it just means every link's health stays
+	// "unknown" (never checked), not broken.
+	healthRepo := postgres.NewHealthRepo(pool)
+
 	svcOpts := []shortener.Option{
 		shortener.WithDefaultTTL(cfg.DefaultLinkTTL),
 		shortener.WithLogger(logger),
+		shortener.WithHealthScheduler(healthRepo),
 	}
 
 	// Caching is opt-in: only wire it up (and only add its readiness
@@ -75,9 +89,25 @@ func run(logger *slog.Logger) error {
 		logger.Info("cache disabled (REDIS_ADDR not set)")
 	}
 
+	// Rate limiting is opt-in too, same reasoning: without RATE_LIMITER_ADDR
+	// the service runs with no throttling rather than refusing to start.
+	var limiter ratelimit.Limiter
+	if cfg.RateLimiterAddr != "" {
+		rlClient, err := grpcclient.Dial(cfg.RateLimiterAddr)
+		if err != nil {
+			return err
+		}
+		defer rlClient.Close()
+
+		limiter = rlClient
+		logger.Info("rate limiting enabled", "rate_limiter_addr", cfg.RateLimiterAddr)
+	} else {
+		logger.Info("rate limiting disabled (RATE_LIMITER_ADDR not set)")
+	}
+
 	svc := shortener.New(postgres.NewLinkRepo(pool), postgres.NewCodeGen(pool, "link_codes"), svcOpts...)
 
-	router := httpapi.NewRouter(svc, multiPinger(pingers), logger)
+	router := httpapi.NewRouter(svc, cfg.APIKeys, limiter, healthRepo, multiPinger(pingers), logger)
 	srv := httpapi.NewServer(cfg.HTTPAddr, router)
 
 	errCh := make(chan error, 1)
