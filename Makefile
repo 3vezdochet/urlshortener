@@ -1,4 +1,4 @@
-.PHONY: build test test-integration vet vet-integration fmt-check
+.PHONY: build test test-integration vet vet-integration fmt-check run docker-up docker-down proto
 
 build:
 	go build ./...
@@ -19,3 +19,24 @@ vet-integration:
 
 fmt-check:
 	@test -z "$$(gofmt -l .)" || (echo "gofmt needs to be run on:"; gofmt -l .; exit 1)
+
+# Requires DATABASE_URL, e.g. the one docker-up brings up on localhost:5432.
+run:
+	go run ./cmd/api
+
+# Full stack: postgres -> redis -> migrate (one-shot) -> api on :8080.
+docker-up:
+	docker compose -f deployments/docker/docker-compose.yml up --build
+
+docker-down:
+	docker compose -f deployments/docker/docker-compose.yml down -v
+
+# Generates internal/ratelimit/grpcclient/ratelimitv1 from the .proto.
+# Requires protoc, protoc-gen-go, protoc-gen-go-grpc on PATH — see README's
+# "Rate limiting" section. Re-point api/ratelimit/v1/ratelimit.proto at your
+# real rate limiter's contract first if it differs from the assumed one.
+proto:
+	protoc \
+		--go_out=. --go_opt=module=urlshortener \
+		--go-grpc_out=. --go-grpc_opt=module=urlshortener \
+		api/ratelimit/v1/ratelimit.proto
