@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"urlshortener/internal/auth"
 	"urlshortener/internal/delivery/httpapi/dto"
 	"urlshortener/internal/delivery/httpapi/handler"
 	"urlshortener/internal/repository/memory"
@@ -15,6 +16,14 @@ import (
 
 func newTestService() *shortener.Service {
 	return shortener.New(memory.NewLinkRepo(), memory.NewCodeGen(0))
+}
+
+// asPrincipal returns req with an authenticated Principal attached to its
+// context, standing in for what middleware.Auth would have done — these
+// are handler-level tests, invoked below Auth, not through it.
+func asPrincipal(req *http.Request, ownerID string) *http.Request {
+	ctx := auth.WithPrincipal(req.Context(), auth.Principal{OwnerID: ownerID})
+	return req.WithContext(ctx)
 }
 
 func TestLinkHandler_Create(t *testing.T) {
@@ -44,7 +53,7 @@ func TestLinkHandler_Create(t *testing.T) {
 				t.Fatalf("marshal request: %v", err)
 			}
 
-			req := httptest.NewRequest(http.MethodPost, "/v1/links", bytes.NewReader(body))
+			req := asPrincipal(httptest.NewRequest(http.MethodPost, "/v1/links", bytes.NewReader(body)), "owner-1")
 			rec := httptest.NewRecorder()
 
 			h.Create(rec, req)
@@ -56,14 +65,47 @@ func TestLinkHandler_Create(t *testing.T) {
 	}
 }
 
+func TestLinkHandler_Create_RequiresPrincipal(t *testing.T) {
+	h := handler.NewLinkHandler(newTestService())
+	body, _ := json.Marshal(dto.CreateLinkRequest{URL: "https://example.com"})
+
+	// No asPrincipal here — simulates the route somehow being reached
+	// without going through Auth first.
+	req := httptest.NewRequest(http.MethodPost, "/v1/links", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	h.Create(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestLinkHandler_Create_SetsOwnerFromPrincipal(t *testing.T) {
+	svc := newTestService()
+	h := handler.NewLinkHandler(svc)
+
+	body, _ := json.Marshal(dto.CreateLinkRequest{URL: "https://example.com", CustomAlias: "promo"})
+	req := asPrincipal(httptest.NewRequest(http.MethodPost, "/v1/links", bytes.NewReader(body)), "owner-1")
+	h.Create(httptest.NewRecorder(), req)
+
+	link, err := svc.Get(req.Context(), "promo")
+	if err != nil {
+		t.Fatalf("Get() unexpected error: %v", err)
+	}
+	if link.OwnerID != "owner-1" {
+		t.Errorf("OwnerID = %q, want %q (should come from the Principal, not request body)", link.OwnerID, "owner-1")
+	}
+}
+
 func TestLinkHandler_Create_DuplicateAlias(t *testing.T) {
 	h := handler.NewLinkHandler(newTestService())
 	body, _ := json.Marshal(dto.CreateLinkRequest{URL: "https://example.com", CustomAlias: "promo"})
 
-	first := httptest.NewRequest(http.MethodPost, "/v1/links", bytes.NewReader(body))
+	first := asPrincipal(httptest.NewRequest(http.MethodPost, "/v1/links", bytes.NewReader(body)), "owner-1")
 	h.Create(httptest.NewRecorder(), first)
 
-	second := httptest.NewRequest(http.MethodPost, "/v1/links", bytes.NewReader(body))
+	second := asPrincipal(httptest.NewRequest(http.MethodPost, "/v1/links", bytes.NewReader(body)), "owner-1")
 	rec := httptest.NewRecorder()
 	h.Create(rec, second)
 
@@ -75,7 +117,7 @@ func TestLinkHandler_Create_DuplicateAlias(t *testing.T) {
 func TestLinkHandler_Create_MalformedJSON(t *testing.T) {
 	h := handler.NewLinkHandler(newTestService())
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/links", bytes.NewReader([]byte("{not json")))
+	req := asPrincipal(httptest.NewRequest(http.MethodPost, "/v1/links", bytes.NewReader([]byte("{not json"))), "owner-1")
 	rec := httptest.NewRecorder()
 
 	h.Create(rec, req)
@@ -90,7 +132,7 @@ func TestLinkHandler_GetAndDeactivate(t *testing.T) {
 	h := handler.NewLinkHandler(svc)
 
 	body, _ := json.Marshal(dto.CreateLinkRequest{URL: "https://example.com", CustomAlias: "promo"})
-	createReq := httptest.NewRequest(http.MethodPost, "/v1/links", bytes.NewReader(body))
+	createReq := asPrincipal(httptest.NewRequest(http.MethodPost, "/v1/links", bytes.NewReader(body)), "owner-1")
 	h.Create(httptest.NewRecorder(), createReq)
 
 	getReq := httptest.NewRequest(http.MethodGet, "/v1/links/promo", nil)
@@ -104,11 +146,12 @@ func TestLinkHandler_GetAndDeactivate(t *testing.T) {
 
 	deactReq := httptest.NewRequest(http.MethodDelete, "/v1/links/promo", nil)
 	deactReq.SetPathValue("code", "promo")
+	deactReq = asPrincipal(deactReq, "owner-1")
 	deactRec := httptest.NewRecorder()
 	h.Deactivate(deactRec, deactReq)
 
 	if deactRec.Code != http.StatusNoContent {
-		t.Fatalf("Deactivate status = %d, want %d", deactRec.Code, http.StatusNoContent)
+		t.Fatalf("Deactivate status = %d, want %d, body=%s", deactRec.Code, http.StatusNoContent, deactRec.Body.String())
 	}
 
 	// Get should still return the (now inactive) link — only the public
@@ -124,6 +167,53 @@ func TestLinkHandler_GetAndDeactivate(t *testing.T) {
 	}
 	if got.Active {
 		t.Error("Active = true after Deactivate, want false")
+	}
+}
+
+func TestLinkHandler_Deactivate_RequiresPrincipal(t *testing.T) {
+	svc := newTestService()
+	h := handler.NewLinkHandler(svc)
+
+	body, _ := json.Marshal(dto.CreateLinkRequest{URL: "https://example.com", CustomAlias: "promo"})
+	createReq := asPrincipal(httptest.NewRequest(http.MethodPost, "/v1/links", bytes.NewReader(body)), "owner-1")
+	h.Create(httptest.NewRecorder(), createReq)
+
+	deactReq := httptest.NewRequest(http.MethodDelete, "/v1/links/promo", nil)
+	deactReq.SetPathValue("code", "promo")
+	rec := httptest.NewRecorder()
+	h.Deactivate(rec, deactReq)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestLinkHandler_Deactivate_RejectsNonOwner(t *testing.T) {
+	svc := newTestService()
+	h := handler.NewLinkHandler(svc)
+
+	body, _ := json.Marshal(dto.CreateLinkRequest{URL: "https://example.com", CustomAlias: "promo"})
+	createReq := asPrincipal(httptest.NewRequest(http.MethodPost, "/v1/links", bytes.NewReader(body)), "owner-1")
+	h.Create(httptest.NewRecorder(), createReq)
+
+	deactReq := httptest.NewRequest(http.MethodDelete, "/v1/links/promo", nil)
+	deactReq.SetPathValue("code", "promo")
+	deactReq = asPrincipal(deactReq, "someone-else")
+	rec := httptest.NewRecorder()
+	h.Deactivate(rec, deactReq)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusForbidden)
+	}
+
+	// And the link must still be active — the rejected attempt shouldn't
+	// have had any effect.
+	link, err := svc.Get(deactReq.Context(), "promo")
+	if err != nil {
+		t.Fatalf("Get() unexpected error: %v", err)
+	}
+	if !link.Active {
+		t.Error("Active = false after a rejected non-owner Deactivate, want true")
 	}
 }
 
@@ -147,7 +237,7 @@ func TestRedirectHandler(t *testing.T) {
 	redirectHandler := handler.NewRedirectHandler(svc)
 
 	body, _ := json.Marshal(dto.CreateLinkRequest{URL: "https://example.com/target", CustomAlias: "promo"})
-	createReq := httptest.NewRequest(http.MethodPost, "/v1/links", bytes.NewReader(body))
+	createReq := asPrincipal(httptest.NewRequest(http.MethodPost, "/v1/links", bytes.NewReader(body)), "owner-1")
 	linkHandler.Create(httptest.NewRecorder(), createReq)
 
 	redirectReq := httptest.NewRequest(http.MethodGet, "/r/promo", nil)
@@ -185,11 +275,12 @@ func TestRedirectHandler_HidesDeactivatedLink(t *testing.T) {
 	redirectHandler := handler.NewRedirectHandler(svc)
 
 	body, _ := json.Marshal(dto.CreateLinkRequest{URL: "https://example.com", CustomAlias: "promo"})
-	createReq := httptest.NewRequest(http.MethodPost, "/v1/links", bytes.NewReader(body))
+	createReq := asPrincipal(httptest.NewRequest(http.MethodPost, "/v1/links", bytes.NewReader(body)), "owner-1")
 	linkHandler.Create(httptest.NewRecorder(), createReq)
 
 	deactReq := httptest.NewRequest(http.MethodDelete, "/v1/links/promo", nil)
 	deactReq.SetPathValue("code", "promo")
+	deactReq = asPrincipal(deactReq, "owner-1")
 	linkHandler.Deactivate(httptest.NewRecorder(), deactReq)
 
 	redirectReq := httptest.NewRequest(http.MethodGet, "/r/promo", nil)
