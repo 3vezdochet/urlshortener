@@ -36,12 +36,29 @@ type HealthScheduler interface {
 	EnsureScheduled(ctx context.Context, code string, dueAt time.Time) error
 }
 
+// Cache lookup outcomes reported to CacheMetricsRecorder.ObserveCacheLookup.
+const (
+	CacheOutcomeHit         = "hit"          // found in cache, served without touching the repository
+	CacheOutcomeNegativeHit = "negative_hit" // cache confirmed the code doesn't exist (SetMissing)
+	CacheOutcomeMiss        = "miss"         // not in cache either way; fell through to the repository
+	CacheOutcomeError       = "error"        // cache itself failed; treated as a miss, logged separately
+)
+
+// CacheMetricsRecorder receives one observation per Resolve cache lookup,
+// classified by outcome (see the CacheOutcome* constants). The production
+// implementation (see the sibling shortenermetrics package) records to
+// Prometheus; this package itself has no Prometheus dependency.
+type CacheMetricsRecorder interface {
+	ObserveCacheLookup(outcome string)
+}
+
 // Service implements link shortening and resolution.
 type Service struct {
 	repo            domain.LinkRepository
 	codeGen         domain.CodeGenerator
-	cache           domain.LinkCache // optional; nil disables caching entirely
-	healthScheduler HealthScheduler  // optional; nil disables availability checking entirely
+	cache           domain.LinkCache     // optional; nil disables caching entirely
+	cacheMetrics    CacheMetricsRecorder // optional; nil records nothing
+	healthScheduler HealthScheduler      // optional; nil disables availability checking entirely
 	now             Clock
 	logger          *slog.Logger
 
@@ -82,6 +99,13 @@ func WithCacheTTL(ttl time.Duration) Option {
 // WithCache is also set.
 func WithNegativeCacheTTL(ttl time.Duration) Option {
 	return func(s *Service) { s.negativeCacheTTL = ttl }
+}
+
+// WithCacheMetrics enables recording each Resolve cache lookup's outcome
+// to rec (see the shortenermetrics package for the Prometheus
+// implementation). Has no effect unless WithCache is also set.
+func WithCacheMetrics(rec CacheMetricsRecorder) Option {
+	return func(s *Service) { s.cacheMetrics = rec }
 }
 
 // WithHealthScheduler enables scheduling a first availability check for
@@ -176,14 +200,21 @@ func (s *Service) Resolve(ctx context.Context, code string) (*domain.Link, error
 		switch {
 		case err != nil:
 			s.logger.Warn("cache get failed", "code", code, "error", err)
+			s.recordCacheOutcome(CacheOutcomeError)
 		case hit:
+			s.recordCacheOutcome(CacheOutcomeHit)
 			return checkAvailable(link, s.now())
 		default:
 			missing, err := s.cache.IsMissing(ctx, code)
-			if err != nil {
+			switch {
+			case err != nil:
 				s.logger.Warn("cache is-missing check failed", "code", code, "error", err)
-			} else if missing {
+				s.recordCacheOutcome(CacheOutcomeError)
+			case missing:
+				s.recordCacheOutcome(CacheOutcomeNegativeHit)
 				return nil, domain.ErrLinkNotFound
+			default:
+				s.recordCacheOutcome(CacheOutcomeMiss)
 			}
 		}
 	}
@@ -267,6 +298,15 @@ func (s *Service) invalidateCache(ctx context.Context, code string) {
 	if err := s.cache.Invalidate(ctx, code); err != nil {
 		s.logger.Warn("cache invalidate failed", "code", code, "error", err)
 	}
+}
+
+// recordCacheOutcome best-effort reports a single Resolve cache lookup's
+// outcome. A no-op unless WithCacheMetrics was configured.
+func (s *Service) recordCacheOutcome(outcome string) {
+	if s.cacheMetrics == nil {
+		return
+	}
+	s.cacheMetrics.ObserveCacheLookup(outcome)
 }
 
 // scheduleHealthCheck best-effort schedules code's first availability

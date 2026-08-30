@@ -329,3 +329,134 @@ func TestService_Resolve_NoCacheConfigured(t *testing.T) {
 		t.Errorf("OriginalURL = %q, want %q", got.OriginalURL, created.OriginalURL)
 	}
 }
+
+// --- cache metrics ----------------------------------------------------------
+
+// fakeCacheMetricsRecorder is a shortener.CacheMetricsRecorder double —
+// verifies Resolve classifies each cache lookup correctly without needing
+// client_golang.
+type fakeCacheMetricsRecorder struct {
+	mu       sync.Mutex
+	outcomes []string
+}
+
+func (f *fakeCacheMetricsRecorder) ObserveCacheLookup(outcome string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.outcomes = append(f.outcomes, outcome)
+}
+
+func (f *fakeCacheMetricsRecorder) last() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.outcomes) == 0 {
+		return ""
+	}
+	return f.outcomes[len(f.outcomes)-1]
+}
+
+func TestService_Resolve_RecordsCacheHit(t *testing.T) {
+	repo := memory.NewLinkRepo()
+	cache := newFakeCache()
+	metrics := &fakeCacheMetricsRecorder{}
+	svc := shortener.New(repo, memory.NewCodeGen(0), shortener.WithCache(cache), shortener.WithCacheMetrics(metrics))
+	ctx := context.Background()
+
+	created, err := svc.Create(ctx, shortener.CreateRequest{OriginalURL: "https://example.com", CustomAlias: "promo"})
+	if err != nil {
+		t.Fatalf("Create() unexpected error: %v", err)
+	}
+	// First Resolve populates the cache (a miss); second is the hit under test.
+	if _, err := svc.Resolve(ctx, created.Code); err != nil {
+		t.Fatalf("first Resolve() unexpected error: %v", err)
+	}
+
+	if _, err := svc.Resolve(ctx, created.Code); err != nil {
+		t.Fatalf("second Resolve() unexpected error: %v", err)
+	}
+
+	if got := metrics.last(); got != shortener.CacheOutcomeHit {
+		t.Errorf("last recorded outcome = %q, want %q", got, shortener.CacheOutcomeHit)
+	}
+}
+
+func TestService_Resolve_RecordsCacheMiss(t *testing.T) {
+	repo := memory.NewLinkRepo()
+	cache := newFakeCache()
+	metrics := &fakeCacheMetricsRecorder{}
+	svc := shortener.New(repo, memory.NewCodeGen(0), shortener.WithCache(cache), shortener.WithCacheMetrics(metrics))
+	ctx := context.Background()
+
+	created, err := svc.Create(ctx, shortener.CreateRequest{OriginalURL: "https://example.com", CustomAlias: "promo"})
+	if err != nil {
+		t.Fatalf("Create() unexpected error: %v", err)
+	}
+
+	if _, err := svc.Resolve(ctx, created.Code); err != nil {
+		t.Fatalf("Resolve() unexpected error: %v", err)
+	}
+
+	if got := metrics.last(); got != shortener.CacheOutcomeMiss {
+		t.Errorf("last recorded outcome = %q, want %q", got, shortener.CacheOutcomeMiss)
+	}
+}
+
+func TestService_Resolve_RecordsCacheNegativeHit(t *testing.T) {
+	repo := memory.NewLinkRepo()
+	cache := newFakeCache()
+	metrics := &fakeCacheMetricsRecorder{}
+	svc := shortener.New(repo, memory.NewCodeGen(0), shortener.WithCache(cache), shortener.WithCacheMetrics(metrics))
+	ctx := context.Background()
+
+	// First Resolve of an unknown code negatively caches it; second is
+	// the negative hit under test.
+	if _, err := svc.Resolve(ctx, "missing"); !errors.Is(err, domain.ErrLinkNotFound) {
+		t.Fatalf("first Resolve() error = %v, want %v", err, domain.ErrLinkNotFound)
+	}
+
+	if _, err := svc.Resolve(ctx, "missing"); !errors.Is(err, domain.ErrLinkNotFound) {
+		t.Fatalf("second Resolve() error = %v, want %v", err, domain.ErrLinkNotFound)
+	}
+
+	if got := metrics.last(); got != shortener.CacheOutcomeNegativeHit {
+		t.Errorf("last recorded outcome = %q, want %q", got, shortener.CacheOutcomeNegativeHit)
+	}
+}
+
+func TestService_Resolve_RecordsCacheError(t *testing.T) {
+	repo := memory.NewLinkRepo()
+	cache := newFakeCache()
+	cache.getErr = errors.New("redis: connection refused")
+	metrics := &fakeCacheMetricsRecorder{}
+	svc := shortener.New(repo, memory.NewCodeGen(0), shortener.WithCache(cache), shortener.WithCacheMetrics(metrics))
+	ctx := context.Background()
+
+	created, err := svc.Create(ctx, shortener.CreateRequest{OriginalURL: "https://example.com", CustomAlias: "promo"})
+	if err != nil {
+		t.Fatalf("Create() unexpected error: %v", err)
+	}
+
+	if _, err := svc.Resolve(ctx, created.Code); err != nil {
+		t.Fatalf("Resolve() unexpected error despite cache failure: %v", err)
+	}
+
+	if got := metrics.last(); got != shortener.CacheOutcomeError {
+		t.Errorf("last recorded outcome = %q, want %q", got, shortener.CacheOutcomeError)
+	}
+}
+
+func TestService_Resolve_NilCacheMetricsRecorderIsSafe(t *testing.T) {
+	repo := memory.NewLinkRepo()
+	cache := newFakeCache()
+	// WithCache but no WithCacheMetrics — must not panic.
+	svc := shortener.New(repo, memory.NewCodeGen(0), shortener.WithCache(cache))
+	ctx := context.Background()
+
+	created, err := svc.Create(ctx, shortener.CreateRequest{OriginalURL: "https://example.com"})
+	if err != nil {
+		t.Fatalf("Create() unexpected error: %v", err)
+	}
+	if _, err := svc.Resolve(ctx, created.Code); err != nil {
+		t.Fatalf("Resolve() unexpected error: %v", err)
+	}
+}
