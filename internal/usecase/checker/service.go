@@ -39,10 +39,11 @@ const (
 
 // Service runs availability checks for links whose next check is due.
 type Service struct {
-	repo   domain.HealthRepository
-	prober Prober
-	now    Clock
-	logger *slog.Logger
+	repo    domain.HealthRepository
+	prober  Prober
+	now     Clock
+	logger  *slog.Logger
+	metrics MetricsRecorder // optional; nil disables metrics entirely
 
 	batchSize       int
 	concurrency     int
@@ -89,6 +90,13 @@ func WithDownInterval(d time.Duration) Option { return func(s *Service) { s.down
 // eventually get rechecked at absurdly long intervals.
 func WithMaxDownInterval(d time.Duration) Option { return func(s *Service) { s.maxDownInterval = d } }
 
+// WithMetrics enables recording checks performed and batch sizes claimed
+// to rec (see the checkermetrics package for the Prometheus
+// implementation). Without this option, RunOnce records nothing — the
+// same "off unless configured" pattern as WithCache in the shortener
+// package.
+func WithMetrics(rec MetricsRecorder) Option { return func(s *Service) { s.metrics = rec } }
+
 // New creates a Service backed by repo (state) and prober (the actual
 // availability check).
 func New(repo domain.HealthRepository, prober Prober, opts ...Option) *Service {
@@ -112,6 +120,7 @@ func (s *Service) RunOnce(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("claim due checks: %w", err)
 	}
+	s.recordBatch(len(due))
 	if len(due) == 0 {
 		return 0, nil
 	}
@@ -136,6 +145,7 @@ func (s *Service) checkOne(ctx context.Context, check domain.DueCheck) {
 	checkedAt := s.now()
 	statusCode, err := s.prober.Probe(ctx, check.OriginalURL)
 	up := err == nil
+	s.recordCheck(up, s.now().Sub(checkedAt))
 
 	consecutiveFails := 0
 	if !up {
@@ -156,6 +166,22 @@ func (s *Service) checkOne(ctx context.Context, check domain.DueCheck) {
 			"code", check.Code, "url", check.OriginalURL,
 			"error", err, "consecutive_fails", consecutiveFails)
 	}
+}
+
+// recordBatch best-effort reports the claimed batch size.
+func (s *Service) recordBatch(n int) {
+	if s.metrics == nil {
+		return
+	}
+	s.metrics.ObserveBatch(n)
+}
+
+// recordCheck best-effort reports a single check's outcome and duration.
+func (s *Service) recordCheck(up bool, duration time.Duration) {
+	if s.metrics == nil {
+		return
+	}
+	s.metrics.ObserveCheck(up, duration)
 }
 
 // nextCheckAt applies a fixed interval for a healthy link and exponential

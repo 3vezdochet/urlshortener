@@ -424,3 +424,83 @@ func (p *trackingProber) Probe(_ context.Context, _ string) (int, error) {
 
 	return 200, nil
 }
+
+// --- fakeMetricsRecorder ----------------------------------------------------
+
+// fakeMetricsRecorder is a checker.MetricsRecorder double. This is the
+// payoff of splitting the Prometheus adapter into checkermetrics: Service's
+// interaction with metrics is verifiable here without client_golang.
+type fakeMetricsRecorder struct {
+	mu           sync.Mutex
+	batches      []int
+	checkResults []bool // true = up, false = down, in call order
+}
+
+func (f *fakeMetricsRecorder) ObserveBatch(n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.batches = append(f.batches, n)
+}
+
+func (f *fakeMetricsRecorder) ObserveCheck(up bool, _ time.Duration) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.checkResults = append(f.checkResults, up)
+}
+
+func TestService_RunOnce_ReportsToMetricsRecorder(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newFakeHealthRepo()
+	repo.addLink("up", "https://example.com/up", now)
+	repo.addLink("down", "https://example.com/down", now)
+
+	prober := newFakeProber()
+	prober.fail("https://example.com/down", 0, errors.New("connection refused"))
+
+	metrics := &fakeMetricsRecorder{}
+	svc := checker.New(repo, prober,
+		checker.WithClock(func() time.Time { return now }),
+		checker.WithMetrics(metrics),
+	)
+
+	if _, err := svc.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce() unexpected error: %v", err)
+	}
+
+	metrics.mu.Lock()
+	defer metrics.mu.Unlock()
+
+	if len(metrics.batches) != 1 || metrics.batches[0] != 2 {
+		t.Errorf("batches recorded = %v, want [2]", metrics.batches)
+	}
+	if len(metrics.checkResults) != 2 {
+		t.Fatalf("check results recorded = %d, want 2", len(metrics.checkResults))
+	}
+
+	var ups, downs int
+	for _, up := range metrics.checkResults {
+		if up {
+			ups++
+		} else {
+			downs++
+		}
+	}
+	if ups != 1 || downs != 1 {
+		t.Errorf("recorded ups=%d downs=%d, want ups=1 downs=1", ups, downs)
+	}
+}
+
+func TestService_RunOnce_NilMetricsRecorderIsSafe(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	repo := newFakeHealthRepo()
+	repo.addLink("abc", "https://example.com", now)
+	prober := newFakeProber()
+
+	// No WithMetrics — must not panic, must behave exactly as before
+	// metrics existed.
+	svc := checker.New(repo, prober, checker.WithClock(func() time.Time { return now }))
+
+	if _, err := svc.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce() unexpected error: %v", err)
+	}
+}
