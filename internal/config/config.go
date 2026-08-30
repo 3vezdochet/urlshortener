@@ -40,6 +40,16 @@ type Config struct {
 	// CheckerInterval is how often cmd/checker polls for due availability
 	// checks. Unused by cmd/api.
 	CheckerInterval time.Duration
+
+	// MetricsAddr is where cmd/checker serves its standalone GET /metrics
+	// (and /healthz). Unused by cmd/api, which serves metrics on its main
+	// HTTPAddr instead — it already has an HTTP server; cmd/checker doesn't.
+	MetricsAddr string
+
+	// OTLPEndpoint enables distributed tracing when non-empty (OTLP/HTTP
+	// collector address, host:port, no scheme — e.g. "otel-collector:4318").
+	// Optional, same "off unless configured" pattern as RedisAddr.
+	OTLPEndpoint string
 }
 
 // Load reads configuration from the environment, applying defaults where
@@ -49,6 +59,8 @@ func Load() (Config, error) {
 		HTTPAddr:        getEnv("HTTP_ADDR", ":8080"),
 		RedisAddr:       os.Getenv("REDIS_ADDR"),
 		RateLimiterAddr: os.Getenv("RATE_LIMITER_ADDR"),
+		MetricsAddr:     getEnv("METRICS_ADDR", ":9090"),
+		OTLPEndpoint:    os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
 	}
 
 	dsn := os.Getenv("DATABASE_URL")

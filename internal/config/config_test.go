@@ -12,6 +12,7 @@ var allEnvKeys = []string{
 	"DATABASE_URL", "HTTP_ADDR", "DEFAULT_LINK_TTL_SECONDS",
 	"REDIS_ADDR", "CACHE_TTL_SECONDS", "NEGATIVE_CACHE_TTL_SECONDS",
 	"API_KEYS", "RATE_LIMITER_ADDR", "CHECKER_INTERVAL_SECONDS",
+	"METRICS_ADDR", "OTEL_EXPORTER_OTLP_ENDPOINT",
 }
 
 func TestLoad(t *testing.T) {
@@ -27,15 +28,17 @@ func TestLoad(t *testing.T) {
 		{
 			name: "custom values including redis, api keys, rate limiter and checker interval",
 			env: map[string]string{
-				"DATABASE_URL":               "postgres://localhost/db",
-				"HTTP_ADDR":                  ":9090",
-				"DEFAULT_LINK_TTL_SECONDS":   "3600",
-				"REDIS_ADDR":                 "localhost:6379",
-				"CACHE_TTL_SECONDS":          "1800",
-				"NEGATIVE_CACHE_TTL_SECONDS": "30",
-				"API_KEYS":                   "sk_abc:frontend,sk_def:cli",
-				"RATE_LIMITER_ADDR":          "localhost:9090",
-				"CHECKER_INTERVAL_SECONDS":   "60",
+				"DATABASE_URL":                "postgres://localhost/db",
+				"HTTP_ADDR":                   ":9090",
+				"DEFAULT_LINK_TTL_SECONDS":    "3600",
+				"REDIS_ADDR":                  "localhost:6379",
+				"CACHE_TTL_SECONDS":           "1800",
+				"NEGATIVE_CACHE_TTL_SECONDS":  "30",
+				"API_KEYS":                    "sk_abc:frontend,sk_def:cli",
+				"RATE_LIMITER_ADDR":           "localhost:9090",
+				"CHECKER_INTERVAL_SECONDS":    "60",
+				"METRICS_ADDR":                ":9091",
+				"OTEL_EXPORTER_OTLP_ENDPOINT": "otel-collector:4318",
 			},
 		},
 		{
@@ -130,6 +133,52 @@ func TestLoad_ParsesSecondsAsDuration(t *testing.T) {
 	}
 	if cfg.CacheTTL != 2*time.Minute {
 		t.Errorf("CacheTTL = %v, want %v", cfg.CacheTTL, 2*time.Minute)
+	}
+}
+
+func TestLoad_MetricsAddrDefault(t *testing.T) {
+	for _, key := range allEnvKeys {
+		t.Setenv(key, "")
+	}
+	t.Setenv("DATABASE_URL", "postgres://localhost/db")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load() unexpected error: %v", err)
+	}
+	if cfg.MetricsAddr != ":9090" {
+		t.Errorf("MetricsAddr = %q, want %q (default)", cfg.MetricsAddr, ":9090")
+	}
+}
+
+func TestLoad_OTLPEndpointDisabledByDefault(t *testing.T) {
+	for _, key := range allEnvKeys {
+		t.Setenv(key, "")
+	}
+	t.Setenv("DATABASE_URL", "postgres://localhost/db")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load() unexpected error: %v", err)
+	}
+	if cfg.OTLPEndpoint != "" {
+		t.Errorf("OTLPEndpoint = %q, want empty (tracing should be opt-in)", cfg.OTLPEndpoint)
+	}
+}
+
+func TestLoad_OTLPEndpointOverride(t *testing.T) {
+	for _, key := range allEnvKeys {
+		t.Setenv(key, "")
+	}
+	t.Setenv("DATABASE_URL", "postgres://localhost/db")
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "otel-collector:4318")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load() unexpected error: %v", err)
+	}
+	if cfg.OTLPEndpoint != "otel-collector:4318" {
+		t.Errorf("OTLPEndpoint = %q, want %q", cfg.OTLPEndpoint, "otel-collector:4318")
 	}
 }
 
