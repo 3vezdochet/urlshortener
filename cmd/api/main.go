@@ -13,13 +13,20 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+
 	"urlshortener/internal/config"
 	"urlshortener/internal/delivery/httpapi"
+	"urlshortener/internal/delivery/httpapi/middleware/httpmetrics"
+	"urlshortener/internal/observability"
+	"urlshortener/internal/observability/tracing"
 	"urlshortener/internal/ratelimit"
 	"urlshortener/internal/ratelimit/grpcclient"
 	"urlshortener/internal/repository/postgres"
 	"urlshortener/internal/repository/rediscache"
 	"urlshortener/internal/usecase/shortener"
+	"urlshortener/internal/usecase/shortener/shortenermetrics"
 )
 
 func main() {
@@ -43,6 +50,29 @@ func run(logger *slog.Logger) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Tracing is opt-in: without OTEL_EXPORTER_OTLP_ENDPOINT, spans are
+	// never created (otelhttp wrapping is skipped below) rather than
+	// created and silently dropped.
+	if cfg.OTLPEndpoint != "" {
+		shutdown, err := tracing.Setup(ctx, "urlshortener-api", cfg.OTLPEndpoint)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := shutdown(shutdownCtx); err != nil {
+				logger.Warn("tracer shutdown failed", "error", err)
+			}
+		}()
+		logger.Info("tracing enabled", "otlp_endpoint", cfg.OTLPEndpoint)
+	} else {
+		logger.Info("tracing disabled (OTEL_EXPORTER_OTLP_ENDPOINT not set)")
+	}
+
+	reg := observability.NewRegistry()
+	httpMetrics := httpmetrics.New(reg)
 
 	pool, err := postgres.NewPool(ctx, cfg.DatabaseURL)
 	if err != nil {
@@ -75,7 +105,10 @@ func run(logger *slog.Logger) error {
 		}
 		defer redisClient.Close()
 
-		svcOpts = append(svcOpts, shortener.WithCache(rediscache.NewCache(redisClient)))
+		svcOpts = append(svcOpts,
+			shortener.WithCache(rediscache.NewCache(redisClient)),
+			shortener.WithCacheMetrics(shortenermetrics.New(reg)),
+		)
 		if cfg.CacheTTL > 0 {
 			svcOpts = append(svcOpts, shortener.WithCacheTTL(cfg.CacheTTL))
 		}
@@ -107,8 +140,27 @@ func run(logger *slog.Logger) error {
 
 	svc := shortener.New(postgres.NewLinkRepo(pool), postgres.NewCodeGen(pool, "link_codes"), svcOpts...)
 
-	router := httpapi.NewRouter(svc, cfg.APIKeys, limiter, healthRepo, multiPinger(pingers), logger)
-	srv := httpapi.NewServer(cfg.HTTPAddr, router)
+	router := httpapi.NewRouter(httpapi.Deps{
+		Service:        svc,
+		Logger:         logger,
+		KeyStore:       cfg.APIKeys,
+		Limiter:        limiter,
+		HealthGetter:   healthRepo,
+		Pinger:         multiPinger(pingers),
+		HTTPMetrics:    httpMetrics,
+		MetricsHandler: promhttp.HandlerFor(reg, promhttp.HandlerOpts{}),
+	})
+
+	// otelhttp wraps the whole router as one top-level span per request,
+	// same reasoning as promhttp/httpmetrics: tracing is composed here at
+	// cmd/api, not inside the httpapi package, which stays free of the
+	// OpenTelemetry dependency entirely.
+	var finalHandler http.Handler = router
+	if cfg.OTLPEndpoint != "" {
+		finalHandler = otelhttp.NewHandler(router, "http.server")
+	}
+
+	srv := httpapi.NewServer(cfg.HTTPAddr, finalHandler)
 
 	errCh := make(chan error, 1)
 	go func() {
