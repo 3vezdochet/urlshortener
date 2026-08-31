@@ -24,7 +24,12 @@ fmt-check:
 run:
 	go run ./cmd/api
 
-# Full stack: postgres -> redis -> migrate (one-shot) -> api on :8080.
+# Same, for the checker process (needs its own terminal — it doesn't exit).
+run-checker:
+	go run ./cmd/checker
+
+# Full stack: postgres -> redis -> migrate (one-shot) -> api + checker,
+# plus jaeger (traces, :16686), prometheus (:9091), grafana (:3000).
 docker-up:
 	docker compose -f deployments/docker/docker-compose.yml up --build
 
