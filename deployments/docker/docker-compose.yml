@@ -56,6 +56,7 @@ services:
       # one running on the host outside Docker. Leave unset to run with no
       # rate limiting, same as today.
       # RATE_LIMITER_ADDR: "host.docker.internal:50051"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "jaeger:4318"
     depends_on:
       postgres:
         condition: service_healthy
@@ -69,14 +70,49 @@ services:
       context: ../..
       dockerfile: deployments/docker/Dockerfile.api
     entrypoint: ["/usr/local/bin/checker"]
+    ports:
+      - "9090:9090" # metrics only — checker has no other HTTP surface
     environment:
       DATABASE_URL: postgres://urlshortener:urlshortener@postgres:5432/urlshortener?sslmode=disable
       CHECKER_INTERVAL_SECONDS: "30"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "jaeger:4318"
     depends_on:
       postgres:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.70.0
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686" # UI
+      - "4318:4318"   # OTLP/HTTP receiver
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9091:9090"
+    depends_on:
+      - api
+      - checker
+
+  grafana:
+    image: grafana/grafana:11.3.1
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/etc/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
 
 volumes:
   pgdata:
