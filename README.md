@@ -1,9 +1,10 @@
 # urlshortener
 
 URL shortener на Go: domain-driven архитектура, кэширование,
-асинхронная проверка доступности целевых ссылок.
+асинхронная проверка доступности целевых ссылок. Полный план — в `docs/` (будет
+добавлен по мере реализации следующих этапов).
 
-## Статус: этап 6 — checker-сервис (проверка доступности)
+## Статус: этап 7 — наблюдаемость (Prometheus/Grafana/трейсинг)
 
 Реализовано:
 - `internal/domain` — сущность `Link`, доменные ошибки, порты (`LinkRepository`,
@@ -13,47 +14,62 @@ URL shortener на Go: domain-driven архитектура, кэширован�
 - `internal/usecase/shortener` — бизнес-логика: `Create`, `Get`, `Resolve`,
   `Deactivate`, cache-aside через `domain.LinkCache` (опционально), плюс
   планирование первой проверки доступности через `HealthScheduler`
-  (опционально) — `Create` просит checker её проверить
+  (опционально); `Resolve` классифицирует каждый поход в кэш
+  (`CacheMetricsRecorder` — опционально) для метрики hit ratio
 - `internal/usecase/checker` — вторая бизнес-логика проекта: `RunOnce`
   забирает пачку просроченных проверок (`ClaimDue`), гоняет их через
   worker pool с ограниченной конкурентностью, пишет результат с фиксированным
-  интервалом (успех) или экспоненциальным backoff с капом (неудача).
-  `httpprobe` — реальный HTTP-пробер (GET, таймаут, 5xx = down)
+  интервалом (успех) или экспоненциальным backoff с капом (неудача), при
+  наличии `MetricsRecorder` репортит число проверок и их длительность.
+  `httpprobe` — реальный HTTP-проубер (GET, таймаут, 5xx = down)
 - `internal/repository/memory`, `internal/repository/postgres`,
   `internal/repository/rediscache` — реализации портов домена (in-memory,
-  Postgres/pgx v5, Redis/go-redis v9); `postgres.HealthRepo` — двухфазный
-  `ClaimDue` (`SELECT ... FOR UPDATE SKIP LOCKED` в короткой транзакции +
-  lease, без удержания блокировки на время самого HTTP-запроса)
+  Postgres/pgx v5, Redis/go-redis v9)
 - `internal/auth` — API-ключи: `Principal`, `KeyStore`, `StaticKeyStore`
   (`API_KEYS=key:owner[:name]` из env), контекст-хелперы
 - `internal/ratelimit` — порт `Limiter` (не завязан на транспорт) +
-  `grpcclient` — клиент к rate limiter'у по gRPC
+  `grpcclient` — клиент к твоему существующему GCRA rate limiter'у по gRPC
   (контракт — `api/ratelimit/v1/ratelimit.proto`, см. раздел "Rate limiting"
-  ниже)
+  ниже — это единственное место, которое надо свести с реальным сервисом)
+- **`internal/observability`** — `NewRegistry()` (общий Prometheus-реестр
+  с Go/process-коллекторами) и `tracing.Setup()` (OpenTelemetry, экспорт
+  трейсов по OTLP/HTTP). Сами метрики живут рядом с кодом, который их
+  производит — `middleware.HTTPMetricsRecorder`, `checker.MetricsRecorder`,
+  `shortener.CacheMetricsRecorder` — это **интерфейсы без единой внешней
+  зависимости**; конкретные Prometheus-реализации (`httpmetrics`,
+  `checkermetrics`, `shortenermetrics`) вынесены в отдельные подпакеты,
+  чтобы `middleware`/`checker`/`shortener` остались тестируемыми без
+  Prometheus. См. раздел "Наблюдаемость" ниже
 - `internal/config` — конфиг из env-переменных, без внешних зависимостей.
-  Кэш и rate limiting — опциональны (`REDIS_ADDR`/`RATE_LIMITER_ADDR`), auth
-  — обязателен: `POST`/`DELETE /v1/links` всегда за API-ключом
-- `internal/delivery/httpapi` — роутер на `net/http` 1.22+, общая цепочка
-  middleware (request id → logging → recover) плюс точечные обёртки на
-  конкретных маршрутах (auth, rate limit — не на всех сразу, см. таблицу
-  эндпоинтов), хендлеры, DTO — `Create` берёт `OwnerID` из аутентифицированного
-  `Principal` (не из тела запроса), `Deactivate` дополнительно проверяет
-  владельца ссылки
-- `cmd/api` — сборка сервиса: config → Postgres → (опц.) Redis → (опц.) rate
-  limiter → usecase → HTTP-сервер с graceful shutdown; readiness проверяет
-  все подключённые зависимости
-- `cmd/checker` — тикер по `CHECKER_INTERVAL_SECONDS`
-  → `checker.Service.RunOnce`. Не часть `cmd/api` — см. раздел "Checker-сервис"
-  ниже
+  Кэш, rate limiting и трейсинг — опциональны (`REDIS_ADDR`/
+  `RATE_LIMITER_ADDR`/`OTEL_EXPORTER_OTLP_ENDPOINT`), метрики — всегда
+  включены, auth — обязателен: `POST`/`DELETE /v1/links` всегда за API-ключом
+- `internal/delivery/httpapi` — роутер на `net/http` 1.22+, принимает единый
+  `Deps` (сервис, ключи, лимитер, health-геттер, пингер, метрики — почти всё
+  опционально кроме сервиса/ключей/логгера), общая цепочка middleware
+  (request id → logging → recover) плюс точечные обёртки на конкретных
+  маршрутах (auth, rate limit, метрики — не одинаково на всех, см. таблицу
+  эндпоинтов). Пакет по-прежнему не импортирует ни `pgx`, ни `grpc`, ни
+  теперь уже `prometheus` — все конкретные реализации собираются в `cmd/api`
+- `cmd/api` — сборка сервиса: config → трейсинг (опц.) → метрики → Postgres →
+  (опц.) Redis → (опц.) rate limiter → usecase → HTTP-сервер с graceful
+  shutdown; readiness проверяет все подключённые зависимости; `/metrics` —
+  на основном порту
+- `cmd/checker` — **отдельный процесс**: тикер по `CHECKER_INTERVAL_SECONDS`
+  → `checker.Service.RunOnce`; свой маленький HTTP-сервер только под
+  `/metrics` и `/healthz` (`METRICS_ADDR`, по умолчанию `:9090`) — у чекера
+  иначе вообще нет HTTP. Не часть `cmd/api` — см. раздел "Checker-сервис"
+  ниже, почему
 - `cmd/migrate` — отдельный бинарник для наката миграций (`DATABASE_URL` из env)
 - `test/integration` — интеграционные тесты на реальном Postgres через
-  **testcontainers-go** (build tag `integration`, локальный Docker)
+  **testcontainers-go** (build tag `integration`, нужен локальный Docker)
 - `deployments/docker` — `Dockerfile.api` (собирает `api`+`migrate`+`checker`)
   + `docker-compose.yml`: postgres → redis → одноразовый `migrate` →
-  `api` + `checker` (с дев-ключом `dev-key` из коробки)
+  `api` + `checker` + `jaeger` (трейсы) + `prometheus` + `grafana`
+  (с готовым дашбордом из коробки)
 
-Ещё не реализовано (следующие этапы): очередь событий, наблюдаемость
-(Prometheus/Grafana/трейсинг).
+Ещё не реализовано: очередь событий (изначально помечена опциональной для
+этого пет-проекта и сознательно пропущена в пользу observability).
 
 ### Эндпоинты
 
@@ -66,6 +82,7 @@ URL shortener на Go: domain-driven архитектура, кэширован�
 | `GET` | `/r/{code}` | нет | редирект 302 (404/410, если ссылки нет/неактивна/просрочена) |
 | `GET` | `/healthz` | нет | liveness |
 | `GET` | `/readyz` | нет | readiness (пингует БД, Redis и rate limiter — что включено) |
+| `GET` | `/metrics` | нет | Prometheus-метрики (в проде обычно закрыт сетевой политикой, не auth) |
 
 `X-API-Key` берётся из `API_KEYS` (см. ниже). `DELETE` дополнительно проверяет,
 что ключ принадлежит владельцу ссылки — иначе `403`, не только `401`.
@@ -73,10 +90,11 @@ URL shortener на Go: domain-driven архитектура, кэширован�
 ## Rate limiting
 
 `POST /v1/links` (по владельцу) и `GET /r/{code}` (по IP) лимит через
-`internal/ratelimit.Limiter` — gRPC-клиентом к
-отдельному GCRA rate limiter'у.
+`internal/ratelimit.Limiter` — но не встроенным алгоритмом, а gRPC-клиентом к
+уже существующему отдельному rate limiter'у.
 
 ```bash
+# один раз:
 go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
 go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
 # и сам protoc: https://protobuf.dev/installation/
@@ -86,12 +104,13 @@ go get google.golang.org/grpc@v1.80.0
 go mod tidy
 ```
 
-Без `RATE_LIMITER_ADDR` rate limiting просто выключен — тот же принцип, что и с `REDIS_ADDR`.
+Без `RATE_LIMITER_ADDR` rate limiting просто выключен — не ошибка, а
+осознанный дефолт, тот же принцип, что и с `REDIS_ADDR`.
 
 ## Checker-сервис
 
-`cmd/checker` — отдельный бинарник и отдельный процесс. 
-Проверка доступности — это
+`cmd/checker` — отдельный бинарник и отдельный процесс, не горутина внутри
+`cmd/api`. Причина архитектурная, не формальная: проверка доступности — это
 I/O-bound работа против произвольных внешних серверов с непредсказуемой
 латентностью (кто-то ответит за 20мс, кто-то будет висеть до таймаута). Если
 гонять это внутри процесса API — она будет соревноваться с обслуживанием
@@ -101,7 +120,7 @@ HTTP-запросов за горутины и усложнит graceful shutdow
 запускать `checker` — сервис останется полностью рабочим, просто у всех
 ссылок `status` будет `unknown`.
 
-**Как реализовано:**
+**How it works:**
 
 1. `shortener.Service.Create` (если сконфигурирован `WithHealthScheduler`)
    создаёт строку в `link_health` со сроком проверки "сейчас" —
@@ -117,12 +136,71 @@ HTTP-запросов за горутины и усложнит graceful shutdow
 4. Результат каждой проверки пишется отдельным `UPDATE` (`Record`) — успех
    планирует следующую проверку через фиксированный интервал
    (`WithUpInterval`), неудача — с экспоненциальным backoff
-   (`WithDownInterval * 2^(fails-1)`, капается `WithMaxDownInterval`), чтобы
-   мёртвый сайт не стучался с постоянной частотой вечно.
+   (`WithDownInterval * 2^(fails-1)`, капается `WithMaxDownInterval`).
 
 Если реплика `checker` упадёт посреди проверки — арендованные строки просто
 станут снова доступны для захвата после истечения `leaseFor`, без отдельной
 задачи на очистку "зависших" проверок.
+
+## Наблюдаемость
+
+### Метрики
+
+И `cmd/api`, и `cmd/checker` отдают `/metrics` в формате Prometheus (у
+`api` — на основном порту, у `checker` — на отдельном `METRICS_ADDR`,
+потому что у него до этого вообще не было HTTP-сервера). Метрики всегда
+включены — не за флагом, в отличие от кэша/rate limiting/трейсинга.
+
+Ключевая архитектурная деталь: **все Prometheus-зависимые типы вынесены в
+отдельные подпакеты**, а в основных пакетах остаются только маленькие
+интерфейсы:
+
+| Интерфейс (без внешних зависимостей) | Реализация на Prometheus |
+|---|---|
+| `middleware.HTTPMetricsRecorder` | `middleware/httpmetrics` |
+| `checker.MetricsRecorder` | `checker/checkermetrics` |
+| `shortener.CacheMetricsRecorder` | `shortener/shortenermetrics` |
+
+Причина: если бы `*Metrics` на Prometheus жил прямо в
+пакете `middleware` (или `checker`, или `shortener`), импорт
+`client_golang` поломал бы сборку **всего пакета** — включая `Auth`,
+`RateLimit`, доменную логику checker'а, cache-aside в `Resolve`. С
+интерфейсом внутри пакета и адаптером снаружи ломается только сам адаптер;
+`go test ./internal/delivery/httpapi/middleware/` по-прежнему проходит
+целиком, метрики проверяются через фейковый `HTTPMetricsRecorder`. Это тот
+же приём, что и `handler.Pinger`/`ratelimit.Limiter`.
+
+Основные метрики:
+- `http_requests_total{method,route,status}`, `http_request_duration_seconds{method,route}`
+  — `route` это **паттерн маршрута** (`"GET /v1/links/{code}"`): иначе каждый конкретный код стал бы собственным значением лейбла и
+  кардинальность росла бы вместе с количеством ссылок. `/healthz`,
+  `/readyz`, `/metrics` намеренно не размечены — иначе probes от
+  Kubernetes забивали бы дашборды шумом.
+- `shortener_cache_lookups_total{outcome}` — `hit`/`negative_hit`/`miss`/`error`,
+  прямо считает cache hit ratio.
+- `checker_checks_total{result}`, `checker_check_duration_seconds`,
+  `checker_claimed_batch_size`.
+- Плюс стандартные Go/process коллекторы (`go_goroutines`, `go_gc_duration_seconds`,
+  `process_resident_memory_bytes`, ...) — из `internal/observability.NewRegistry()`.
+
+### Трейсинг
+
+OpenTelemetry, экспорт по OTLP/HTTP — опционально, включается
+`OTEL_EXPORTER_OTLP_ENDPOINT`. В `docker-compose.yml` за ним стоит Jaeger
+(UI на `:16686`). Как и с метриками, `internal/delivery/httpapi` не
+импортирует OpenTelemetry напрямую — HTTP-инструментация (`otelhttp`)
+оборачивает уже собранный роутер в `cmd/api`, а не встроена в сам пакет.
+В `cmd/checker` трейсинг — это декоратор `tracingProber` вокруг
+`checker.Prober`, тоже собранный на месте, а не внутри пакета `checker`.
+
+### Grafana
+
+`deployments/docker/grafana/dashboards/urlshortener.json` — дашборд из
+6 панелей (request rate по маршрутам, p50/p99 латентность, 5xx error rate,
+cache hit ratio, checker checks по результату, checker duration),
+подключается автоматически через provisioning при `make docker-up`
+(`localhost:3000`, анонимный доступ включён для дев-стенда). Датасорс
+(Prometheus) тоже прописывается сам, руками ничего добавлять не нужно.
 
 ## Установка зависимостей
 
@@ -132,6 +210,11 @@ go get github.com/pressly/goose/v3@v3.27.3
 go get github.com/testcontainers/testcontainers-go@latest
 go get github.com/testcontainers/testcontainers-go/modules/postgres@latest
 go get google.golang.org/grpc@v1.80.0
+go get github.com/prometheus/client_golang@v1.20.5
+go get go.opentelemetry.io/otel@v1.31.0
+go get go.opentelemetry.io/otel/sdk@v1.31.0
+go get go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp@v1.31.0
+go get go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp@v0.56.0
 go mod tidy
 ```
 
@@ -146,15 +229,18 @@ make test       # go test ./... -race -cover  (in-memory + httpapi + auth + redi
 make vet        # go vet ./...
 make fmt-check  # проверка форматирования
 
-# Поднять весь стек (postgres -> redis -> migrate -> api + checker) через
-# docker-compose, с дев-ключом "dev-key" из коробки:
-make docker-up      # http://localhost:8080
+# Поднять весь стек (postgres -> redis -> migrate -> api + checker, плюс
+# jaeger/prometheus/grafana) через docker-compose, с дев-ключом "dev-key":
+make docker-up      # api :8080, checker metrics :9090, jaeger UI :16686,
+                     # prometheus :9091, grafana :3000 (анонимный доступ)
 make docker-down    # погасить и снести volume
 
 curl -X POST localhost:8080/v1/links \
   -H 'X-API-Key: dev-key' -H 'Content-Type: application/json' \
   -d '{"url":"https://example.com"}'
 curl localhost:8080/v1/links/<code>/health   # статус доступности, после того как checker хотя бы раз пройдётся
+curl localhost:8080/metrics                  # метрики api
+curl localhost:9090/metrics                  # метрики checker'а (отдельный порт)
 
 # Или руками: postgres + redis, миграции, локальный API + checker
 docker compose -f deployments/docker/docker-compose.yml up -d postgres redis
@@ -162,9 +248,10 @@ export DATABASE_URL="postgres://urlshortener:urlshortener@localhost:5432/urlshor
 export REDIS_ADDR="localhost:6379"            # опционально — без неё кэш выключен
 export API_KEYS="dev-key:dev"                 # обязательно — без ключей все POST/DELETE вернут 401
 export RATE_LIMITER_ADDR="localhost:50051"    # опционально — без него rate limiting выключен
+export OTEL_EXPORTER_OTLP_ENDPOINT="localhost:4318"  # опционально — без него трейсинг выключен
 go run ./cmd/migrate
-make run                    # go run ./cmd/api, слушает :8080
-go run ./cmd/checker &      # отдельный процесс; без него /health всегда "unknown"
+make run           # go run ./cmd/api, слушает :8080 (в т.ч. /metrics)
+make run-checker   # go run ./cmd/checker, отдельный терминал; /metrics на :9090
 
 # Интеграционные тесты (сами поднимают/гасят контейнер Postgres через testcontainers):
 make test-integration
@@ -214,7 +301,7 @@ make test-integration
   использует `Get` — владелец должен видеть, что ссылка деактивирована, а не
   получать голый 404, как посторонний.
 - **Request ID без стороннего uuid-пакета**: `crypto/rand` + `hex` на 8 байт
-  достаточно для корреляции логов одного запроса; можно подтянуть `google/uuid` с 1.27.
+  достаточно для корреляции логов одного запроса; можно подтянуть `google/uuid` с Go 1.27 
 - **Порядок middleware**: `RequestID → Logging → Recover → mux`. `Recover`
   должен быть ближе к `mux`, чтобы ловить паники хендлеров; `Logging` — снаружи
   от `Recover`, чтобы залогировать финальный статус (500) даже после
@@ -232,7 +319,7 @@ make test-integration
   несуществующими кодами полностью обходит кэш и бьёт по БД напрямую
   (classic cache penetration).
 - **Инвалидация при записи, а не только TTL**: `Create` и `Deactivate` чистят
-  кэш (`Invalidate`) сразу, а не ждут, пока пройдёт TTL. Без этого
+  кэш (`Invalidate`) сразу, а не ждут, пока истечет TTL. Без этого
   деактивированная ссылка ещё до часа продолжала бы редиректить по старому
   URL, а созданная под алиасом, который до этого негативно закэшировался бы,
   ещё минуту казалась бы несуществующей.
@@ -276,7 +363,7 @@ make test-integration
 - **Двухфазный `ClaimDue`, а не одна долгая транзакция**: `SELECT ... FOR
   UPDATE SKIP LOCKED` + `UPDATE next_check_at` коммитятся за миллисекунды;
   сам HTTP-запрос к целевому URL идёт уже без открытой транзакции. Держать
-  транзакцию (и, соответственно, соединение из пула) открытой на всё время
+  транзакцию (и, соответственно, подключение из пула) открытой на всё время
   сетевого запроса с непредсказуемой латентностью — способ быстро исчерпать
   пул соединений под нагрузкой.
 - **Lease вместо отдельной задачи на "зависшие" проверки**: если `checker`
@@ -286,7 +373,7 @@ make test-integration
   или другая реплика). Не нужен ни cron на очистку, ни ручное вмешательство.
 - **Backoff считает usecase, не SQL**: `consecutive_fails` и `next_check_at`
   вычисляются в Go (`checker.Service.nextCheckAt`) и передаются в `Record`
-  готовыми значениями. Строка уже
+  готовыми значениями, а не через `CASE WHEN` в `UPDATE`. Строка уже
   эксклюзивно захвачена этим воркером через lease, гонки нет — но бизнес-
   правило "как долго ждать после N неудач" — это то, что должно быть
   протестировано юнит-тестами на Go, а не проверено вручную через SQL.
@@ -306,3 +393,35 @@ make test-integration
   таблица. Сайт может быть помечен как `down` и продолжать редиректить —
   это осознанно: пользователь должен решать, довериться ли статусу, а не
   быть заблокированным middleware, который сам может ошибаться.
+- **Метрики — за интерфейсом, реализация в отдельном подпакете**: раздел
+  "Наблюдаемость" выше объясняет почему (иначе импорт `client_golang`
+  ломает сборку всего пакета-хозяина, а не только адаптера). Тот же приём,
+  доведённый до логического предела, что и `handler.Pinger`/
+  `ratelimit.Limiter`/`shortener.HealthScheduler` — маленький интерфейс на
+  стороне потребителя, конкретная реализация собирается в `cmd/*`.
+- **`route`, а не `r.URL.Path`, в лейбле HTTP-метрик**: Go 1.22 `ServeMux`
+  не отдаёт хендлеру смэтченный паттерн через `*http.Request` (проверено —
+  такого поля там нет), так что вместо попытки его как-то восстановить,
+  `route` передаётся явно в момент регистрации каждого маршрута
+  (`deps.wrapMetrics("GET /v1/links/{code}", ...)`). Тот же путь, что
+  используется в `mux.Handle`, буквально копируется в лейбл — не может
+  разъехаться.
+- **`/healthz`, `/readyz`, `/metrics` не размечены HTTP-метриками**: это
+  scrape/probe-трафик, а не пользовательский — если считать его наравне с
+  остальным, дашборды забиваются шумом от k8s-проб и от самого Prometheus,
+  дёргающего `/metrics` каждые 15 секунд.
+- **`internal/observability` — только реестр и настройка трейсера, не сами
+  метрики**: соблазн был сложить всё "наблюдаемое" в один пакет, но тогда
+  `NewRegistry()` (нужен почти всем) тянул бы за собой то, что нужно не
+  всем. Метрики остаются рядом с кодом, который их производит — тот же
+  принцип локальности, что и с доменными портами.
+- **HTTP-инструментация трейсинга (`otelhttp`) оборачивает роутер в
+  `cmd/api`, не встроена в `httpapi`**: тот же паттерн, что с
+  `promhttp`/`httpmetrics` — пакет транспорта не должен решать, каким
+  трейсером или экспортёром пользоваться; это решение уровня сборки
+  процесса, а не библиотеки.
+- **Grafana-дашборд — provisioning**: датасорс и
+  сам дашборд подключаются автоматически через файлы в
+  `grafana/provisioning`, смонтированные read-only в контейнер — после
+  `make docker-up` в Grafana сразу есть рабочие панели, а не пустой
+  экран с инструкцией "добавь источник данных".
